@@ -243,6 +243,20 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     error TEXT,
     created_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS alert_states (
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    sent_early INTEGER DEFAULT 0,
+    sent_entry INTEGER DEFAULT 0,
+    sent_explosion INTEGER DEFAULT 0,
+    sent_weakening INTEGER DEFAULT 0,
+    below_count INTEGER DEFAULT 0,
+    last_score REAL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(symbol, timeframe)
+);
 """
 
 
@@ -276,6 +290,146 @@ async def save_checkpoint(scan_no: int, symbols: int, candidates: int,
             (scan_no, symbols, candidates, analyzed, alerts, seconds, error,
              now_local().isoformat()),
         )
+        await db.commit()
+
+
+async def claim_stage_once(
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    stage: str,
+    score: float,
+) -> bool:
+    """
+    يمنع تكرار المرحلة نفسها لنفس الحركة، ويستمر المنع حتى بعد إعادة تشغيل Railway.
+    تعاد تهيئة الحالة فقط بعد هدوء الدرجة تحت الحد المبكر لعدة فحوص.
+    """
+    column = {
+        "EARLY": "sent_early",
+        "ENTRY": "sent_entry",
+        "EXPLOSION": "sent_explosion",
+        "WEAKENING": "sent_weakening",
+    }[stage]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (
+            await db.execute(
+                "SELECT * FROM alert_states WHERE symbol=? AND timeframe=?",
+                (symbol, timeframe),
+            )
+        ).fetchone()
+
+        ts = now_local().isoformat()
+        if row is None:
+            values = {
+                "sent_early": 0,
+                "sent_entry": 0,
+                "sent_explosion": 0,
+                "sent_weakening": 0,
+            }
+            values[column] = 1
+            await db.execute(
+                """INSERT INTO alert_states
+                   (symbol,timeframe,direction,sent_early,sent_entry,
+                    sent_explosion,sent_weakening,below_count,last_score,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    symbol, timeframe, direction,
+                    values["sent_early"], values["sent_entry"],
+                    values["sent_explosion"], values["sent_weakening"],
+                    0, score, ts,
+                ),
+            )
+            await db.commit()
+            return True
+
+        # اتجاه جديد قوي يبدأ دورة جديدة بدل خلطه مع الحركة السابقة.
+        if row["direction"] != direction:
+            await db.execute(
+                f"""UPDATE alert_states
+                    SET direction=?, sent_early=0, sent_entry=0,
+                        sent_explosion=0, sent_weakening=0,
+                        below_count=0, last_score=?, updated_at=?,
+                        {column}=1
+                    WHERE symbol=? AND timeframe=?""",
+                (direction, score, ts, symbol, timeframe),
+            )
+            await db.commit()
+            return True
+
+        if int(row[column] or 0) == 1:
+            await db.execute(
+                """UPDATE alert_states
+                   SET last_score=?,below_count=0,updated_at=?
+                   WHERE symbol=? AND timeframe=?""",
+                (score, ts, symbol, timeframe),
+            )
+            await db.commit()
+            return False
+
+        # لا نرجع إلى مرحلة أقل بعد دخول أو انفجار.
+        if stage == "EARLY" and (row["sent_entry"] or row["sent_explosion"]):
+            await db.commit()
+            return False
+        if stage == "ENTRY" and row["sent_explosion"]:
+            await db.commit()
+            return False
+
+        await db.execute(
+            f"""UPDATE alert_states
+                SET {column}=1,last_score=?,below_count=0,updated_at=?
+                WHERE symbol=? AND timeframe=?""",
+            (score, ts, symbol, timeframe),
+        )
+        await db.commit()
+        return True
+
+
+async def update_quiet_state(
+    symbol: str,
+    timeframe: str,
+    max_score: float,
+) -> None:
+    """
+    بعد ثلاثة فحوص هادئة متتالية تحت الحد المبكر بـ8 نقاط،
+    يسمح بدورة جديدة. هذا يمنع إعادة التنبيه بسبب اهتزاز الدرجة.
+    """
+    quiet_limit = EARLY_THRESHOLD - 8.0
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (
+            await db.execute(
+                "SELECT below_count FROM alert_states WHERE symbol=? AND timeframe=?",
+                (symbol, timeframe),
+            )
+        ).fetchone()
+        if row is None:
+            return
+
+        if max_score < quiet_limit:
+            count = int(row["below_count"] or 0) + 1
+            if count >= 3:
+                await db.execute(
+                    """DELETE FROM alert_states
+                       WHERE symbol=? AND timeframe=?""",
+                    (symbol, timeframe),
+                )
+            else:
+                await db.execute(
+                    """UPDATE alert_states
+                       SET below_count=?,last_score=?,updated_at=?
+                       WHERE symbol=? AND timeframe=?""",
+                    (count, max_score, now_local().isoformat(), symbol, timeframe),
+                )
+        else:
+            await db.execute(
+                """UPDATE alert_states
+                   SET below_count=0,last_score=?,updated_at=?
+                   WHERE symbol=? AND timeframe=?""",
+                (max_score, now_local().isoformat(), symbol, timeframe),
+            )
         await db.commit()
 
 
@@ -396,10 +550,38 @@ def candle_features(rows: list[list[Any]]) -> dict[str, float | bool]:
     range_pct = safe_div(sum(ranges) / len(ranges), price) * 100
     compression = clamp(100 - safe_div(range_pct, max(atr_pct, 1e-9)) * 55)
 
-    recent_high = max(highs[-11:-1])
-    recent_low = min(lows[-11:-1])
-    breakout_up = price > recent_high
-    breakout_down = price < recent_low
+    breakout_age_up = 99
+    breakout_age_down = 99
+    breakout_level_up = 0.0
+    breakout_level_down = 0.0
+
+    for age in range(0, 6):
+        idx = len(closes) - 1 - age
+        if idx < 12:
+            break
+        prior_high = max(highs[idx-10:idx])
+        prior_low = min(lows[idx-10:idx])
+
+        if breakout_age_up == 99 and closes[idx] > prior_high:
+            breakout_age_up = age
+            breakout_level_up = prior_high
+
+        if breakout_age_down == 99 and closes[idx] < prior_low:
+            breakout_age_down = age
+            breakout_level_down = prior_low
+
+    breakout_up = breakout_age_up == 0
+    breakout_down = breakout_age_down == 0
+
+    extension_up_atr = (
+        safe_div(price - breakout_level_up, atr_value)
+        if breakout_level_up > 0 else 0.0
+    )
+    extension_down_atr = (
+        safe_div(breakout_level_down - price, atr_value)
+        if breakout_level_down > 0 else 0.0
+    )
+    move_3_atr = safe_div(closes[-1] - closes[-4], atr_value) if len(closes) >= 4 else 0.0
 
     ema200 = ema(closes[-210:], 200)
     ema_context = safe_div(price - ema200, max(atr_value, 1e-12))
@@ -420,7 +602,6 @@ def candle_features(rows: list[list[Any]]) -> dict[str, float | bool]:
     cvd_accel = safe_div(cvd_now - 2 * cvd_prev, max(sum(quote_volumes[-10:]), 1)) * 100
 
     body = closes[-1] - opens[-1]
-    body_atr = safe_div(body, atr_value)
     lower_wick = min(opens[-1], closes[-1]) - lows[-1]
     upper_wick = highs[-1] - max(opens[-1], closes[-1])
 
@@ -434,15 +615,19 @@ def candle_features(rows: list[list[Any]]) -> dict[str, float | bool]:
         "compression": compression,
         "breakout_up": breakout_up,
         "breakout_down": breakout_down,
+        "breakout_age_up": float(breakout_age_up),
+        "breakout_age_down": float(breakout_age_down),
+        "extension_up_atr": extension_up_atr,
+        "extension_down_atr": extension_down_atr,
+        "move_3_atr": move_3_atr,
         "ema_context": ema_context,
         "real_delta": real_delta,
         "cvd_bias": cvd_bias,
         "cvd_accel": cvd_accel,
-        "body_atr": body_atr,
+        "body_atr": safe_div(body, atr_value),
         "lower_wick_atr": safe_div(lower_wick, atr_value),
         "upper_wick_atr": safe_div(upper_wick, atr_value),
     }
-
 
 def orderbook_features(depth: dict[str, Any]) -> dict[str, float]:
     bids = [(float(p), float(q)) for p, q in depth.get("bids", [])]
@@ -543,8 +728,16 @@ def weighted_score(direction: str, f: dict[str, float | bool]) -> tuple[float, l
 
 def choose_stage(score: float, previous_score: float, previous_stage: str | None) -> str | None:
     change = score - previous_score
-    if previous_stage in {"ENTRY", "EXPLOSION"} and change <= -WEAKENING_DROP:
+
+    # ضعف الزخم لا يعني انعكاس الاتجاه. لا نرسله لمجرد هبوط الدرجة
+    # بينما الإشارة ما زالت قوية؛ يجب أن تهبط دون مستوى "دخول الآن".
+    if (
+        previous_stage in {"ENTRY", "EXPLOSION"}
+        and change <= -WEAKENING_DROP
+        and score < ENTRY_THRESHOLD
+    ):
         return "WEAKENING"
+
     if score >= EXPLOSION_THRESHOLD:
         return "EXPLOSION"
     if score >= ENTRY_THRESHOLD:
@@ -554,17 +747,112 @@ def choose_stage(score: float, previous_score: float, previous_stage: str | None
     return None
 
 
+
+
+def timing_gate(
+    direction: str,
+    stage: str,
+    timeframe: str,
+    f: dict[str, float | bool],
+) -> tuple[bool, str]:
+    """
+    1H يبقى سريعًا ومرنًا نسبيًا.
+    4H يمنع مطاردة شمعة انفجارية ممتدة حتى لو كانت شمعة الكسر نفسها.
+    """
+    if direction == "BUY":
+        age = int(float(f["breakout_age_up"]))
+        extension = float(f["extension_up_atr"])
+        move_3 = float(f["move_3_atr"])
+        body_atr = float(f["body_atr"])
+    else:
+        age = int(float(f["breakout_age_down"]))
+        extension = float(f["extension_down_atr"])
+        move_3 = -float(f["move_3_atr"])
+        body_atr = -float(f["body_atr"])
+
+    if stage in {"EARLY", "WEAKENING"}:
+        return True, ""
+
+    if timeframe == "1h":
+        if stage == "ENTRY":
+            if age > 1:
+                return False, f"مرّ {age} شمعات منذ الكسر"
+            if extension > 1.05:
+                return False, f"امتداد الساعة {extension:.2f} ATR"
+            if move_3 > 2.20:
+                return False, f"آخر 3 شمعات قطعت {move_3:.2f} ATR"
+            return True, ""
+
+        if stage == "EXPLOSION":
+            if age > 2:
+                return False, f"مرّ {age} شمعات منذ الكسر"
+            if extension > 1.80:
+                return False, f"امتداد الساعة {extension:.2f} ATR"
+            return True, ""
+
+    # 4H: لا دخول إذا استهلكت شمعة الكسر الجزء الأكبر من الحركة.
+    if timeframe == "4h":
+        if stage == "ENTRY":
+            if age > 0:
+                return False, f"دخول 4H مسموح على شمعة الكسر فقط؛ العمر {age}"
+            if extension > 0.60:
+                return False, f"امتداد 4H متأخر {extension:.2f} ATR"
+            if body_atr > 0.90:
+                return False, f"جسم شمعة 4H ممتد {body_atr:.2f} ATR"
+            if move_3 > 1.80:
+                return False, f"حركة 4H استهلكت {move_3:.2f} ATR"
+            return True, ""
+
+        if stage == "EXPLOSION":
+            if age > 1:
+                return False, f"مرّ {age} شمعات منذ كسر 4H"
+            if extension > 1.20:
+                return False, f"امتداد انفجار 4H {extension:.2f} ATR"
+            if body_atr > 1.50:
+                return False, f"شمعة 4H انفجارية ومطاردتها خطرة"
+            return True, ""
+
+    return False, "فريم غير مدعوم"
+
+def weakening_reasons(direction: str, f: dict[str, float | bool], score_change: float) -> list[str]:
+    sign = 1 if direction == "BUY" else -1
+    reasons: list[str] = []
+
+    if score_change <= -WEAKENING_DROP:
+        reasons.append(f"هبوط درجة الزخم بمقدار {abs(score_change):.1f} نقطة")
+    if sign * float(f["price_accel"]) <= 0:
+        reasons.append("توقف أو انعكاس تسارع السعر")
+    if float(f["volume_accel"]) <= 0:
+        reasons.append("تباطؤ تسارع الحجم")
+    if sign * float(f["cvd_bias"]) < 2:
+        reasons.append("ضعف دعم CVD للاتجاه")
+    if sign * float(f["real_delta"]) < 3:
+        reasons.append("تراجع سيطرة الدلتا الحقيقية")
+    if sign * float(f["oi_change"]) <= 0:
+        reasons.append("العقود المفتوحة لم تعد تدعم الحركة")
+    if sign * float(f["orderbook"]) <= 0:
+        reasons.append("اختلال دفتر الأوامر لم يعد داعمًا")
+    if not bool(f["breakout_up"] if direction == "BUY" else f["breakout_down"]):
+        reasons.append("فشل استمرار كسر البنية")
+
+    return reasons[:7] or ["تراجع واضح في زخم الإشارة السابقة"]
+
 def trade_plan(direction: str, price: float, atr_value: float,
                recent_high: float, recent_low: float) -> tuple[float, ...]:
-    buffer = max(atr_value * 0.12, price * 0.0005)
+    buffer = max(atr_value * 0.10, price * 0.0005)
+    max_risk = max(atr_value * 1.25, price * 0.003)
+
     if direction == "BUY":
-        entry_low, entry_high = price - buffer, price + buffer * 0.35
-        stop = min(recent_low - buffer, price - atr_value * 0.85)
-        risk = max(price - stop, atr_value * 0.5)
+        entry_low = price - buffer
+        entry_high = price + buffer * 0.30
+        stop = max(recent_low - buffer, price - max_risk)
+        risk = max(price - stop, atr_value * 0.45)
         return entry_low, entry_high, stop, price + risk, price + 2*risk, price + 3*risk
-    entry_low, entry_high = price - buffer * 0.35, price + buffer
-    stop = max(recent_high + buffer, price + atr_value * 0.85)
-    risk = max(stop - price, atr_value * 0.5)
+
+    entry_low = price - buffer * 0.30
+    entry_high = price + buffer
+    stop = min(recent_high + buffer, price + max_risk)
+    risk = max(stop - price, atr_value * 0.45)
     return entry_low, entry_high, stop, price - risk, price - 2*risk, price - 3*risk
 
 
@@ -599,6 +887,9 @@ def build_message(sig: Signal) -> str:
     time_text = datetime.fromisoformat(sig.created_at).strftime("%d-%m-%Y %H:%M:%S")
 
     plan = ""
+    weakening_note = ""
+    if sig.stage == "WEAKENING":
+        weakening_note = "\nℹ️ هذا تنبيه ضعف للاتجاه السابق، وليس إشارة انعكاس أو دخول معاكس.\n"
     if sig.stage in {"ENTRY", "EXPLOSION"}:
         plan = f"""
 🎯 الدخول: <b>{fmt_price(sig.entry_low)} – {fmt_price(sig.entry_high)}</b>
@@ -620,7 +911,7 @@ def build_message(sig: Signal) -> str:
 📈 تغير الدرجة: <b>{sig.score_change:+.1f}</b>
 🎯 توافق العوامل: <b>{sig.active_count}/13</b>
 {quality}
-{plan}
+{weakening_note}{plan}
 📊 أسباب التنبيه
 {reasons}
 
@@ -659,7 +950,7 @@ class Engine:
         if SEND_STARTUP_MESSAGE and BOT_TOKEN and CHAT_ID:
             await send_telegram(
                 self.telegram,
-                "✅ <b>Ahmed Early Explosion Trader بدأ العمل</b>\n\n"
+                "✅ <b>Ahmed Early Explosion Trader v1.3 FINAL-TIMING بدأ العمل</b>\n\n"
                 f"⏰ الفريمات: {' / '.join(x.upper() for x in TIMEFRAMES)}\n"
                 "🟡 استعداد مبكر جدًا\n🟠 دخول الآن\n🔥 بداية الانفجار\n⚠️ ضعف الزخم\n\n"
                 "❌ لا يستخدم RSI أو MACD أو Stoch RSI أو KDJ.",
@@ -797,6 +1088,8 @@ class Engine:
                         reasons = buy_reasons if direction == "BUY" else sell_reasons
                         active = buy_active if direction == "BUY" else sell_active
 
+                        await update_quiet_state(symbol, tf, score)
+
                         if score - opposite < MIN_DIRECTION_GAP:
                             continue
 
@@ -805,6 +1098,11 @@ class Engine:
                         previous_score = float(old.get("score", 0))
                         previous_stage = old.get("stage")
                         stage = choose_stage(score, previous_score, previous_stage)
+                        score_change = score - previous_score
+                        if stage == "WEAKENING":
+                            reasons = weakening_reasons(direction, common, score_change)
+                            active = len(reasons)
+
                         self.state[key] = {
                             "score": score,
                             "stage": stage or previous_stage,
@@ -813,24 +1111,40 @@ class Engine:
                         if not stage:
                             continue
 
-                        # لا نكرر نفس المرحلة خلال فترة التهدئة.
-                        last_sent = old.get("last_sent")
-                        if (
-                            previous_stage == stage
-                            and isinstance(last_sent, datetime)
-                            and now_local() - last_sent < timedelta(minutes=COOLDOWN_MINUTES)
-                        ):
-                            continue
-                        # لا نرسل رجوعًا إلى مرحلة أقل، باستثناء ضعف الزخم.
-                        if stage != "WEAKENING" and stage_rank(stage) <= stage_rank(previous_stage or ""):
-                            continue
                         if stage == "WEAKENING" and not SEND_WEAKENING_ALERTS:
                             continue
 
+                        allowed_timing, timing_reason = timing_gate(direction, stage, tf, common)
+                        if not allowed_timing:
+                            log.info(
+                                "blocked late signal %s %s %s: %s",
+                                symbol, tf, direction, timing_reason
+                            )
+                            continue
+
+                        # لا نحجز المرحلة إلا بعد اجتياز فلتر التوقيت.
+                        if not await claim_stage_once(symbol, tf, direction, stage, score):
+                            continue
+
                         price = float(cf["price"])
-                        recent_high = max(float(x[2]) for x in rows[-11:-1])
-                        recent_low = min(float(x[3]) for x in rows[-11:-1])
+                        recent_high = max(float(x[2]) for x in rows[-4:])
+                        recent_low = min(float(x[3]) for x in rows[-4:])
                         plan = trade_plan(direction, price, float(cf["atr"]), recent_high, recent_low)
+                        if stage in {"ENTRY", "EXPLOSION"}:
+                            age = int(float(
+                                cf["breakout_age_up"] if direction == "BUY"
+                                else cf["breakout_age_down"]
+                            ))
+                            extension = float(
+                                cf["extension_up_atr"] if direction == "BUY"
+                                else cf["extension_down_atr"]
+                            )
+                            reasons = [
+                                f"الإشارة في بداية الكسر: عمر الكسر {age} شمعة",
+                                f"الامتداد بعد الكسر {extension:.2f} ATR",
+                                *reasons,
+                            ][:7]
+
                         sig = Signal(
                             symbol=symbol,
                             timeframe=tf,
@@ -839,7 +1153,7 @@ class Engine:
                             price=price,
                             score=score,
                             opposite_score=opposite,
-                            score_change=score - previous_score,
+                            score_change=score_change,
                             active_count=active,
                             pressure_score=float(cf["compression"]),
                             volume_acceleration=float(cf["volume_accel"]),
@@ -860,7 +1174,6 @@ class Engine:
                             reasons=reasons,
                             created_at=now_local().isoformat(),
                         )
-                        old["last_sent"] = now_local()
                         old["stage"] = stage
                         self.state[key] = old
                         output.append(sig)
@@ -975,7 +1288,7 @@ app = FastAPI(title="Ahmed Early Explosion Trader", lifespan=lifespan)
 async def health():
     return {
         "ok": engine.last_error is None,
-        "service": "Ahmed Early Explosion Trader",
+        "service": "Ahmed Early Explosion Trader v1.3 FINAL-TIMING",
         "timeframes": TIMEFRAMES,
         "scan_number": engine.scan_no,
         "last_scan": engine.last_scan,
@@ -1076,7 +1389,7 @@ body{{font-family:Arial;background:#0a1020;color:#eef2ff;margin:0;padding:22px}}
 a{{color:#8ebaff}} code{{color:#ffd27a}}
 </style></head>
 <body><div class="wrap">
-<h1>Ahmed Early Explosion Trader</h1>
+<h1>Ahmed Early Explosion Trader v1.3 FINAL-TIMING</h1>
 <div class="card"><b>الحالة: {status}</b><br>الفريمات: {' / '.join(x.upper() for x in TIMEFRAMES)}<br>
 آخر فحص: {h['last_scan'] or 'لم يبدأ'}<br>الخطأ: {html.escape(str(h['last_error'] or 'لا يوجد'))}</div>
 <div class="grid">
